@@ -87,6 +87,69 @@ func (d *Device) Image() (image.Image, error) {
 	}, nil
 }
 
+// RGBA decodes the visible part of the framebuffer into im, using the color
+// bitfields reported by the device. im is reallocated if its size doesn't
+// match the visible resolution.
+func (d *Device) RGBA(im *image.RGBA) error {
+	vinfo, err := d.VarScreeninfo()
+	if err != nil {
+		return err
+	}
+	return decodeRGBA(im, d.mmap, int(d.finfo.Line_length), vinfo)
+}
+
+func decodeRGBA(im *image.RGBA, mem []byte, stride int, vinfo VarScreeninfo) error {
+	bpp := vinfo.Bits_per_pixel
+	if bpp != 16 && bpp != 24 && bpp != 32 {
+		return fmt.Errorf("%d bits per pixel unsupported", bpp)
+	}
+	var (
+		lut   [3][256]uint8
+		shift [3]uint32
+		mask  [3]uint32
+	)
+	for i, bf := range []Bitfield{vinfo.Red, vinfo.Green, vinfo.Blue} {
+		if bf.Length == 0 || bf.Right != 0 || bf.Offset+bf.Length > bpp {
+			return fmt.Errorf("unsupported color bitfield %+v", bf)
+		}
+		n, sh := bf.Length, bf.Offset
+		if n > 8 {
+			sh += n - 8
+			n = 8
+		}
+		max := uint32(1)<<n - 1
+		for v := uint32(0); v <= max; v++ {
+			lut[i][v] = uint8(v * 255 / max)
+		}
+		shift[i], mask[i] = sh, max
+	}
+
+	w, h := int(vinfo.Xres), int(vinfo.Yres)
+	x0, y0 := int(vinfo.Xoffset), int(vinfo.Yoffset)
+	bytespp := int(bpp / 8)
+	if w == 0 || h == 0 || (x0+w)*bytespp > stride || (y0+h)*stride > len(mem) {
+		return errors.New("visual resolution not contained in framebuffer")
+	}
+	if r := image.Rect(0, 0, w, h); im.Rect != r {
+		*im = *image.NewRGBA(r)
+	}
+	for y := 0; y < h; y++ {
+		src := mem[(y0+y)*stride+x0*bytespp:][:w*bytespp]
+		dst := im.Pix[y*im.Stride:][:4*w]
+		for x := 0; x < w; x++ {
+			var v uint32
+			for i := bytespp - 1; i >= 0; i-- {
+				v = v<<8 | uint32(src[x*bytespp+i])
+			}
+			dst[4*x] = lut[0][v>>shift[0]&mask[0]]
+			dst[4*x+1] = lut[1][v>>shift[1]&mask[1]]
+			dst[4*x+2] = lut[2][v>>shift[2]&mask[2]]
+			dst[4*x+3] = 0xff
+		}
+	}
+	return nil
+}
+
 func (d *Device) Close() error {
 	e1 := unix.Munmap(d.mmap)
 	if e2 := unix.Close(int(d.fd)); e2 != nil {

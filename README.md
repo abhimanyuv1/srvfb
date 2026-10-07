@@ -12,8 +12,8 @@ be acceptable (it might be, though).
 
 This should be considered a tech demo in the current state. The code is not
 particularly clean, it's not in any way secured, probably not very efficient
-and it's taylored specifically to the reMarkable (e.g. it can only stream
-16-bit grayscale images). Feel free to use it and report any bugs you find, but
+and it's taylored specifically to the reMarkable (e.g. it streams 16-bit
+grayscale images, unless `-color` is given). Feel free to use it and report any bugs you find, but
 I don't make any promises in regards to support or stability and any issues not
 directly related to my usecase will likely be closed.
 
@@ -49,6 +49,15 @@ and open `http://localhost:1234/` in your browser.
 
 Once you can see the reMarkable screen in your browser (via proxy or not),
 clicking on the image should rotate it by 90°.
+
+By default, the framebuffer is interpreted as 16-bit grayscale. To stream a
+color framebuffer (16, 24 or 32 bits per pixel), pass `-color` to the `srvfb`
+serving the device. A proxy picks this up automatically.
+
+To reduce the amount of data sent to the browser, pass `-quality <1-100>`. The
+frames are then encoded as lossy JPEGs of that quality instead of lossless
+PNGs. In proxy-mode, this flag belongs on the proxy; the stream between device
+and proxy is always raw.
 
 This repository also contains systemd unit files to run `srvfb` automatically
 (using socket activation). For security reasons, it only listens on the USB
