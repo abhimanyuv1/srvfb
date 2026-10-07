@@ -1,8 +1,10 @@
 # srvfb - Stream framebuffer content over HTTP
 
 This repository contains a small webserver that can serve the contents of a
-linux framebuffer device as video over HTTP. The video is encoded as a series
-of PNGs, which are served in a `multipart/x-mixed-replace` stream. The primary
+linux framebuffer device as video over HTTP. Both grayscale and color
+framebuffers are supported. The video is encoded as a series of PNGs (or,
+optionally, lossy JPEGs), which are served in a `multipart/x-mixed-replace`
+stream. The primary
 use case is to stream a [reMarkable][reMarkable] screen to a computer and share
 it from there via video-conferencing or capturing it. For that reason, there is
 also a proxy-mode, which streams the frames as raw, uncompressed data from the
@@ -12,8 +14,8 @@ be acceptable (it might be, though).
 
 This should be considered a tech demo in the current state. The code is not
 particularly clean, it's not in any way secured, probably not very efficient
-and it's taylored specifically to the reMarkable (e.g. it streams 16-bit
-grayscale images, unless `-color` is given). Feel free to use it and report any bugs you find, but
+and it's taylored specifically to the reMarkable (e.g. it assumes a 16-bit
+grayscale framebuffer, unless `-color` is given). Feel free to use it and report any bugs you find, but
 I don't make any promises in regards to support or stability and any issues not
 directly related to my usecase will likely be closed.
 
@@ -50,14 +52,37 @@ and open `http://localhost:1234/` in your browser.
 Once you can see the reMarkable screen in your browser (via proxy or not),
 clicking on the image should rotate it by 90°.
 
-By default, the framebuffer is interpreted as 16-bit grayscale. To stream a
-color framebuffer (16, 24 or 32 bits per pixel), pass `-color` to the `srvfb`
-serving the device. A proxy picks this up automatically.
+# Color
+
+By default, the framebuffer is interpreted as 16-bit grayscale, which is what
+the reMarkable needs. To stream a color framebuffer, pass `-color` to the
+`srvfb` serving the device:
+
+```
+./srvfb -device /dev/fb0 -listen :1234 -color
+```
+
+Framebuffers with 16, 24 or 32 bits per pixel are supported (e.g. RGB565 or
+XRGB8888). The position of the red, green and blue channels is taken from what
+the device reports, so no further configuration is needed. A proxy picks up
+color automatically, but both ends have to be built from a version that
+supports it.
+
+# Reducing the amount of data
 
 To reduce the amount of data sent to the browser, pass `-quality <1-100>`. The
 frames are then encoded as lossy JPEGs of that quality instead of lossless
-PNGs. In proxy-mode, this flag belongs on the proxy; the stream between device
-and proxy is always raw.
+PNGs:
+
+```
+./srvfb -device /dev/fb0 -listen :1234 -color -quality 50
+```
+
+Grayscale frames are reduced to 8 bits per pixel when `-quality` is set. In
+proxy-mode, this flag belongs on the proxy; the stream between device and
+proxy is always raw.
+
+# systemd
 
 This repository also contains systemd unit files to run `srvfb` automatically
 (using socket activation). For security reasons, it only listens on the USB
