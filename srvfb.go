@@ -23,6 +23,7 @@ import (
 	"hash"
 	"hash/fnv"
 	"image"
+	"image/jpeg"
 	"io"
 	"log"
 	"mime"
@@ -55,6 +56,8 @@ func run() error {
 	proxy := flag.String("proxy", "", "Proxy the screen from the given address")
 	device := flag.String("device", "", "Framebuffer device to serve")
 	idle := flag.Duration("idle", 0, "Exit if there's no activity for this time. 0 disables this")
+	color := flag.Bool("color", false, "Serve the framebuffer in color instead of 16-bit grayscale. Only valid with -device")
+	quality := flag.Int("quality", 0, "Serve lossy JPEGs of this quality (1-100) instead of PNGs. 0 serves lossless PNGs")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		return errors.New("usage: srvfb [<flags>]")
@@ -62,6 +65,12 @@ func run() error {
 
 	if (*proxy == "") == (*device == "") {
 		return errors.New("exactly one of -proxy or -device is required")
+	}
+	if *color && *proxy != "" {
+		return errors.New("-color has to be set on the srvfb serving the device, not on the proxy")
+	}
+	if *quality < 0 || *quality > 100 {
+		return errors.New("-quality has to be between 0 and 100")
 	}
 	if len(listenFDs) > 1 {
 		return errors.New("more than one file descriptor passed by service manager")
@@ -95,6 +104,8 @@ func run() error {
 		return err
 	}
 	h.proxy = *proxy
+	h.color = *color
+	h.quality = *quality
 	http.Handle("/", h)
 	if err = http.Serve(l, nil); err == errIdle {
 		log.Printf("No activity for %v, shutting down", *idle)
@@ -104,8 +115,69 @@ func run() error {
 }
 
 type handler struct {
-	fb    *fb.Device
-	proxy string
+	fb      *fb.Device
+	proxy   string
+	color   bool
+	quality int
+}
+
+// frame is a single frame of the stream. The pixel data is either 16-bit
+// big-endian grayscale or, if color is set, 8-bit RGBA.
+type frame struct {
+	pix    []byte
+	stride int
+	rect   image.Rectangle
+	color  bool
+
+	gray image.Gray
+}
+
+func (f *frame) bitsPerPixel() uint8 {
+	if f.color {
+		return 32
+	}
+	return 16
+}
+
+func (f *frame) image() image.Image {
+	if f.color {
+		return &image.RGBA{Pix: f.pix, Stride: f.stride, Rect: f.rect}
+	}
+	return &image.Gray16{Pix: f.pix, Stride: f.stride, Rect: f.rect}
+}
+
+// image8 is like image, but reduces grayscale frames to 8 bits per pixel, as
+// JPEG can't store more.
+func (f *frame) image8() image.Image {
+	if f.color {
+		return f.image()
+	}
+	src := &image.Gray16{Pix: f.pix, Stride: f.stride, Rect: f.rect}
+	if f.gray.Rect != f.rect {
+		f.gray = *image.NewGray(f.rect)
+	}
+	i := 0
+	for y := f.rect.Min.Y; y < f.rect.Max.Y; y++ {
+		for x := f.rect.Min.X; x < f.rect.Max.X; x++ {
+			f.gray.Pix[i] = f.pix[src.PixOffset(x, y)]
+			i++
+		}
+	}
+	return &f.gray
+}
+
+func (h *handler) contentType() string {
+	if h.quality > 0 {
+		return "image/jpeg"
+	}
+	return "image/png"
+}
+
+func (h *handler) encode(w io.Writer, enc *png.Encoder, f *frame) error {
+	if h.quality > 0 {
+		return jpeg.Encode(w, f.image8(), &jpeg.Options{Quality: h.quality})
+	}
+	return enc.Encode(w, f.image())
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -150,7 +222,7 @@ func (h *handler) serveRaw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	im := new(image.Gray16)
+	im := new(frame)
 	if err := h.readImage(im); err != nil {
 		log.Println(err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -170,7 +242,7 @@ func (h *handler) serveRaw(w http.ResponseWriter, r *http.Request) {
 		log.Println(err)
 		return
 	}
-	rhdr := &rawHeader{version, 16, uint16(im.Stride), uint32(im.Rect.Dx()), uint32(im.Rect.Dy())}
+	rhdr := &rawHeader{version, im.bitsPerPixel(), uint16(im.stride), uint32(im.rect.Dx()), uint32(im.rect.Dy())}
 	if err = binary.Write(part, binary.BigEndian, rhdr); err != nil {
 		log.Println(err)
 		return
@@ -180,7 +252,7 @@ func (h *handler) serveRaw(w http.ResponseWriter, r *http.Request) {
 		log.Println(err)
 		return
 	}
-	_, err = w.Write(im.Pix[im.Rect.Min.Y*im.Stride : im.Rect.Max.Y*im.Stride])
+	_, err = w.Write(im.pix[im.rect.Min.Y*im.stride : im.rect.Max.Y*im.stride])
 	if err != nil {
 		log.Println(err)
 		return
@@ -193,7 +265,7 @@ func (h *handler) serveRaw(w http.ResponseWriter, r *http.Request) {
 			log.Println(err)
 			return
 		}
-		pix := im.Pix[im.Rect.Min.Y*im.Stride : im.Rect.Max.Y*im.Stride]
+		pix := im.pix[im.rect.Min.Y*im.stride : im.rect.Max.Y*im.stride]
 		if dedup.skip(pix) {
 			continue
 		}
@@ -220,7 +292,7 @@ func (h *handler) serveVideo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var reader interface {
-		readImage(im *image.Gray16) error
+		readImage(im *frame) error
 	}
 
 	if h.proxy != "" {
@@ -242,8 +314,8 @@ func (h *handler) serveVideo(w http.ResponseWriter, r *http.Request) {
 	mpw := multipart.NewWriter(w)
 	mpw.SetBoundary("endofsection")
 	hdr := make(textproto.MIMEHeader)
-	hdr.Add("Content-Type", "image/png")
-	im := new(image.Gray16)
+	hdr.Add("Content-Type", h.contentType())
+	im := new(frame)
 	enc := &png.Encoder{CompressionLevel: png.BestSpeed}
 	var dedup deduper
 	for {
@@ -251,7 +323,7 @@ func (h *handler) serveVideo(w http.ResponseWriter, r *http.Request) {
 			log.Println(err)
 			return
 		}
-		if dedup.skip(im.Pix) {
+		if dedup.skip(im.pix) {
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
@@ -260,14 +332,14 @@ func (h *handler) serveVideo(w http.ResponseWriter, r *http.Request) {
 			log.Println(err)
 			return
 		}
-		enc.Encode(w, im)
+		h.encode(w, enc, im)
 		flusher.Flush()
 	}
 }
 
 func (h *handler) serveImage(w http.ResponseWriter, r *http.Request) {
 	var reader interface {
-		readImage(im *image.Gray16) error
+		readImage(im *frame) error
 	}
 
 	if h.proxy != "" {
@@ -283,14 +355,14 @@ func (h *handler) serveImage(w http.ResponseWriter, r *http.Request) {
 		reader = h
 	}
 
-	im := new(image.Gray16)
+	im := new(frame)
 	if err := reader.readImage(im); err != nil {
 		log.Println(err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "image/png")
-	png.Encode(w, im)
+	w.Header().Set("Content-Type", h.contentType())
+	h.encode(w, new(png.Encoder), im)
 }
 
 func (h *handler) serveIndex(w http.ResponseWriter, r *http.Request) {
@@ -365,7 +437,15 @@ func (h *handler) serveIndex(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, idx)
 }
 
-func (h *handler) readImage(im *image.Gray16) error {
+func (h *handler) readImage(im *frame) error {
+	if h.color {
+		rgba := &image.RGBA{Pix: im.pix, Stride: im.stride, Rect: im.rect}
+		if err := h.fb.RGBA(rgba); err != nil {
+			return err
+		}
+		im.pix, im.stride, im.rect, im.color = rgba.Pix, rgba.Stride, rgba.Rect, true
+		return nil
+	}
 	vim, err := h.fb.Image()
 	if err != nil {
 		return err
@@ -374,15 +454,15 @@ func (h *handler) readImage(im *image.Gray16) error {
 	if !ok {
 		return errors.New("framebuffer is not 16-bit grayscale")
 	}
-	if len(im.Pix) < len(gim.Pix) {
-		im.Pix = append(im.Pix, make([]byte, len(gim.Pix)-len(im.Pix))...)
+	if len(im.pix) < len(gim.Pix) {
+		im.pix = append(im.pix, make([]byte, len(gim.Pix)-len(im.pix))...)
 	}
-	copy(im.Pix, gim.Pix)
-	for i := 1; i < len(im.Pix); i += 2 {
-		im.Pix[i-1], im.Pix[i] = im.Pix[i], im.Pix[i-1]
+	copy(im.pix, gim.Pix)
+	for i := 1; i < len(im.pix); i += 2 {
+		im.pix[i-1], im.pix[i] = im.pix[i], im.pix[i-1]
 	}
-	im.Stride = gim.Stride
-	im.Rect = gim.Rect
+	im.stride = gim.Stride
+	im.rect = gim.Rect
 	return nil
 }
 
@@ -392,6 +472,7 @@ type proxyconn struct {
 	stride int
 	width  int
 	height int
+	color  bool
 }
 
 func dialProxy(addr string) (*proxyconn, error) {
@@ -437,7 +518,11 @@ func (c *proxyconn) readHdr(resp *http.Response) error {
 	if hdr.Version != version {
 		return fmt.Errorf("incompatible version %d", hdr.BitsPerPixel)
 	}
-	if hdr.BitsPerPixel != 16 {
+	switch hdr.BitsPerPixel {
+	case 16:
+	case 32:
+		c.color = true
+	default:
 		return fmt.Errorf("incompatible bits per pixel %d", hdr.BitsPerPixel)
 	}
 	c.stride = int(hdr.Stride)
@@ -446,12 +531,13 @@ func (c *proxyconn) readHdr(resp *http.Response) error {
 	return nil
 }
 
-func (c *proxyconn) readImage(im *image.Gray16) error {
-	if len(im.Pix) != c.stride*c.height {
-		*im = image.Gray16{
-			Pix:    make([]byte, c.stride*c.height),
-			Stride: c.stride,
-			Rect:   image.Rect(0, 0, c.width, c.height),
+func (c *proxyconn) readImage(im *frame) error {
+	if len(im.pix) != c.stride*c.height {
+		*im = frame{
+			pix:    make([]byte, c.stride*c.height),
+			stride: c.stride,
+			rect:   image.Rect(0, 0, c.width, c.height),
+			color:  c.color,
 		}
 	}
 	part, err := c.r.NextPart()
@@ -462,7 +548,7 @@ func (c *proxyconn) readImage(im *image.Gray16) error {
 	if ct := part.Header.Get("Content-Type"); ct != "binary/octet-stream" {
 		return fmt.Errorf("unknown Content-Type %q for part", ct)
 	}
-	_, err = io.ReadFull(part, im.Pix)
+	_, err = io.ReadFull(part, im.pix)
 	return err
 }
 
